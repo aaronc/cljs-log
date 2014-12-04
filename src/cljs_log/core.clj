@@ -23,30 +23,36 @@
 (defmacro register-level! [level value]
   (swap! levels assoc level value))
 
-(defn- get-config []
-  (or *config* dev-config))
+(defn- swap-config! [f args]
+  (let [config (or *config* dev-config)]
+    (loop []
+      (let [cur @config
+            next (apply f cur args)]
+        (if (compare-and-set! config cur)
+          (when (not= cur next)
+            (swap! config dissoc :enable-cache))
+          (recur))))))
 
 (defmacro set-global-level!
   [level]
-  (swap! (get-config) assoc :global level))
+  (swap-config! assoc :global level))
 
 (defmacro set-ns-level!
-  ([level] (set-ns-level! ana/*cljs-ns* level))
-  ([ns level]
-   (swap! (get-config) assoc ns level)))
+  ([level] (swap-config! assoc ana/*cljs-ns* level))
+  ([ns level] (swap-config! assoc ns level)))
 
 (defmacro override-global-level!
   [level]
-  (swap! (get-config) swap! assoc :global-override level))
+  (swap-config! swap! assoc :global-override level))
 
 (defmacro override-ns-level!
   ([level])
   ([ns level]
-   (swap! (get-config) assoc-in [:overrides ns] level)))
+   (swap-config! assoc-in [:overrides ns] level)))
 
 (defmacro for-production [& body])
 
-(defn- get-active-config [] @dev-config)
+(defn- get-active-config [] dev-config)
 
 (def ns-parts
   (memoize
@@ -59,28 +65,35 @@
 
 (defn- is-enabled?
   ([level]
-   (let [{:keys [global global-override overrides] :as config} (get-active-config)
-         logger (get-logger) 
-         parts (ns-parts logger)]
-     (or
-      (>= level global-override)
+   (let [logger (get-logger)
+         active-config (get-active-config)
+         {:keys [enable-cache] :as config} @active-config]
+     (if-let [enabled? (get enable-cache [logger level])]
+       enabled?
+       (let [{:keys [global global-override overrides]} config
+             parts (ns-parts logger)
+             enabled?
+             (or
+              (>= level global-override)
 
-      (loop [[part & parts] parts]
-        (when part
-          (if (when-let [p (get overrides part)]
-                (>= p level))
-            true
-            (recur parts))))
+              (loop [[part & parts] parts]
+                (when part
+                  (if (when-let [p (get overrides part)]
+                        (>= p level))
+                    true
+                    (recur parts))))
 
-      (and
-       (>= level global)
-       (loop [[part & parts] parts]
-         (if part
-           (let [p (get config part)]
-             (if (or (not p) (>= p level))
-               (recur parts)
-               false))
-           true)))))))
+              (and
+               (>= level global)
+               (loop [[part & parts] parts]
+                 (if part
+                   (let [p (get config part)]
+                     (if (or (not p) (>= p level))
+                       (recur parts)
+                       false))
+                   true))))]
+         (swap! active-config assoc-in [:enable-cache [logger level] enabled?])
+         enabled?)))))
 
 (defn- get-log-level [level]
   (condp >= (or (get @levels level) level)
@@ -92,4 +105,59 @@
     :fatal))
 
 (defmacro log [level & args]
-  `(cljs-log.core/print-log ~(get-logger) ~(get-log-level level) ~@args))
+  (when (is-enabled? level)
+    `(cljs-log.core/print-log ~(get-logger) ~(get-log-level level) ~@args)))
+
+(defmacro trace [& args] `(cljs-log.core/log :trace ~@args))
+(defmacro debug [& args] `(cljs-log.core/log :debug ~@args))
+(defmacro info [& args] `(cljs-log.core/log :info ~@args))
+(defmacro warn [& args] `(cljs-log.core/log :warn ~@args))
+(defmacro error [& args] `(cljs-log.core/log :error ~@args))
+(defmacro fatal [& args] `(cljs-log.core/log :fatal ~@args))
+
+(defn- cond-macro [default-level body macro-fn]
+  (let [level? (first body)
+        level (when (keyword? level?) level?)
+        gname (if level (second body) level?)
+        body (if level (nnext body) (next body))
+        level (or level default-level)]
+    (when (is-enabled? level)
+      (macro-fn level name body))))
+
+(defmacro with-group [& body]
+  (cond-macro
+   :info body
+   (fn [level name body]
+     `(do
+        (.group js/console ~name)
+        ~@body
+        (.groupEnd js/console)))))
+
+(defmacro with-group-collapsed [& body]
+  (cond-macro
+   :info body
+   (fn [level name body]
+     `(do
+        (.groupCollapsed js/console ~name)
+        ~@body
+        (.groupEnd js/console)))))
+
+(defmacro with-time [& body]
+  (cond-macro
+   :info body
+   (fn [level name body]
+     `(do
+        (.time js/console ~name)
+        ~@body
+        (.timeEnd js/console ~name)))))
+
+(defmacro with-profile [& body]
+  (cond-macro
+   :info body
+   (fn [level name body]
+     `(do
+        (.profile js/console ~name)
+        ~@body
+        (.profileEnd js/console)))))
+
+;; (defmacro pst [])
